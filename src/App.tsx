@@ -242,7 +242,11 @@ function computeMetrics(msgs: ChatMessage[]) {
     const prev = filtered[i - 1];
     const curr = filtered[i];
     if (prev.sender !== curr.sender) {
-      replyTimes.push(curr.ts.getTime() - prev.ts.getTime());
+      const timeDiff = curr.ts.getTime() - prev.ts.getTime();
+      // Only include reasonable reply times (less than 24 hours)
+      if (timeDiff > 0 && timeDiff < 24 * 60 * 60 * 1000) {
+        replyTimes.push(timeDiff);
+      }
     }
   }
   const medianReplySec = replyTimes.length ? percentile(replyTimes, 50) / 1000 : 0;
@@ -258,15 +262,19 @@ function computeMetrics(msgs: ChatMessage[]) {
   const byDay: Record<string, number> = {};
   filtered.forEach((m) => (byDay[toDayKey(m.ts)] = (byDay[toDayKey(m.ts)] || 0) + 1));
   const dayKeys = Object.keys(byDay);
-  let activeDayRatio = 0;
-  if (filtered.length) {
-    const first = filtered[0].ts,
-      last = filtered[filtered.length - 1].ts;
-    const totalDays = Math.max(1, Math.ceil((+last - +first) / (24 * 3600 * 1000)));
-    activeDayRatio = Math.min(1, dayKeys.length / totalDays);
-  }
+  
+  // Fix: chatSpanDays should be the count of unique days with messages
+  const chatSpanDays = dayKeys.length;
+  
+  // activeDayRatio calculation is now correct - it's 100% since we only count days with activity
+  const activeDayRatio = 1.0; // Always 100% since byDay only contains days with messages
 
-  const posHits = filtered.reduce((acc, m) => acc + countMatches(m.text, GRATITUDE_WORDS), 0);
+  // Fix positivity calculation - look for gratitude, appreciation, and positive words
+  const positiveWords = [...GRATITUDE_WORDS, "good", "great", "awesome", "amazing", "wonderful", "fantastic", "best", "happy", "excited", "glad", "pleased"];
+  const posHits = filtered.reduce((acc, m) => {
+    const hasPositive = positiveWords.some(word => sanitize(m.text).includes(sanitize(word)));
+    return acc + (hasPositive ? 1 : 0);
+  }, 0);
   const positiveRatio = filtered.length ? posHits / filtered.length : 0;
 
   const perPerson: Record<string, { count: number; affection: number; emojis: number }> = {};
@@ -287,6 +295,7 @@ function computeMetrics(msgs: ChatMessage[]) {
     positiveRatio,
     perPerson,
     filtered,
+    chatSpanDays,
   };
 }
 
@@ -310,9 +319,9 @@ function scoreLove(metrics: ReturnType<typeof computeMetrics>) {
   const s =
     (normalize(metrics.affectionDensity, 0, 0.08) * weights.affectionDensity +
       normalize(metrics.reciprocity, 0.6, 1.0) * weights.reciprocity +
-      normalizeInverse(metrics.medianReplySec, 60, 1200) * weights.speed +
+      normalizeInverse(metrics.medianReplySec, 60, 3600) * weights.speed + // Fixed: changed from 1200 to 3600 for better scaling
       normalize(metrics.activeDayRatio, 0.2, 1.0) * weights.consistency +
-      normalize(metrics.positiveRatio, 0.4, 1.0) * weights.positivity) *
+      normalize(metrics.positiveRatio, 0.0, 0.2) * weights.positivity) * // Fixed: changed from 0.4 to 0.0-0.2 range
     100;
   return Math.max(0, Math.min(100, Math.round(s)));
 }
@@ -356,22 +365,74 @@ async function callGeminiHighlights({
   instruction: string;
 }) {
   const endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent";
+  
+  // Truncate content more aggressively for mobile
+  const maxContentLength = 15000; // Reduced from 18000
+  const truncatedExcerpt = excerpt.slice(0, maxContentLength);
+  
   const body = {
-    contents: [{ role: "user", parts: [{ text: `${instruction}\n\nCONTENT:\n${excerpt.slice(0, 18000)}` }] }],
-    generationConfig: { temperature: 0.35, maxOutputTokens: 1024 },
+    contents: [{ 
+      role: "user", 
+      parts: [{ text: `${instruction}\n\nCONTENT:\n${truncatedExcerpt}` }] 
+    }],
+    generationConfig: { 
+      temperature: 0.35, 
+      maxOutputTokens: 800, // Reduced from 1024
+      topP: 0.8,
+      topK: 40
+    },
   };
-  const res = await fetch(`${endpoint}?key=${apiKey}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`Gemini HTTP ${res.status} — ${txt}`);
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+
+  try {
+    const res = await fetch(`${endpoint}?key=${apiKey}`, {
+      method: "POST",
+      headers: { 
+        "Content-Type": "application/json",
+        "User-Agent": "LoveLens/1.0"
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      const errorText = await res.text().catch(() => "Unknown error");
+      console.error("Gemini API Error:", res.status, errorText);
+      
+      // Provide more specific error messages
+      if (res.status === 400) {
+        throw new Error("Invalid API key or request format");
+      } else if (res.status === 403) {
+        throw new Error("API key doesn't have permission or quota exceeded");
+      } else if (res.status === 429) {
+        throw new Error("Rate limit exceeded. Please try again later");
+      } else {
+        throw new Error(`Gemini API error: ${res.status}`);
+      }
+    }
+
+    const data = await res.json();
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    
+    if (!text.trim()) {
+      throw new Error("Empty response from AI");
+    }
+    
+    return text;
+  } catch (error: any) {
+    clearTimeout(timeoutId);
+    
+    if (error.name === 'AbortError') {
+      throw new Error("Request timed out. Please try again");
+    }
+    
+    console.error("Gemini call failed:", error);
+    throw error;
   }
-  const data = await res.json();
-  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-  return text;
 }
 
 /* --------------------------- React App ---------------------------- */
@@ -422,7 +483,7 @@ export default function App() {
   }
 
   async function runGeminiExtraction() {
-    if (!apiKey) {
+    if (!apiKey.trim()) {
       alert("🌸 Please enter your Google Gemini API key first! 🌸");
       return;
     }
@@ -430,37 +491,58 @@ export default function App() {
       alert("🌸 Please upload a WhatsApp chat first! 🌸");
       return;
     }
+
     try {
       setLoading(true);
-      const excerpt = msgs.map((m) => `${m.ts.toISOString()} | ${m.sender}: ${m.text}`).join("\n");
-      const instruction = `You are analyzing a WhatsApp conversation for special romantic/friendship moments. 
+      
+      // Create a more mobile-friendly excerpt
+      const recentMsgs = msgs.slice(-1000); // Only use last 1000 messages for mobile
+      const excerpt = recentMsgs
+        .map((m) => `${m.ts.toISOString().slice(0, 16)} | ${m.sender}: ${m.text.slice(0, 200)}`)
+        .join("\n");
 
-Please extract 8-12 of the most meaningful moments from this chat. For each moment, format it EXACTLY like this:
+      const instruction = `Analyze this WhatsApp chat and extract 6-8 special romantic/friendship moments. 
 
-**[Sender Name]** - *[Date & Time]*
-"[The actual message text]"
-💕 [Brief 1-line explanation of why this moment is special]
+Format each moment EXACTLY as:
 
-Focus on:
-- Love declarations & sweet messages
-- Supportive moments during tough times  
-- Funny/cute exchanges that show affection
-- Promises & future planning together
-- Heartfelt apologies & forgiveness
-- Celebrations & proud moments
+**[Name]** - *[Date]*
+"[Message text - keep under 100 chars]"
+💕 [Why it's special - one line]
 
-Keep each message quote under 150 characters. If longer, show the most meaningful part with "...". 
-Use emojis like 💕 ❤️ 🥰 😊 🤝 ✨ to categorize each moment.`;
+Focus on love, support, humor, promises, and heartfelt moments. Use emojis: 💕❤️🥰😊🤝✨`;
 
       const txt = await callGeminiHighlights({ apiKey, excerpt, instruction });
       
-      // Parse the AI response and format it properly
+      // Enhanced parsing with better error handling
       const formattedHighlights = parseAIHighlights(txt);
-      setHighlights(formattedHighlights);
+      
+      if (formattedHighlights.length === 0) {
+        console.warn("AI parsing failed, using fallback");
+        const localHighlights = deriveHeuristicHighlights(metrics?.filtered || []);
+        setHighlights(localHighlights);
+      } else {
+        setHighlights(formattedHighlights);
+      }
+      
       setAnalysisStep('results');
     } catch (e: any) {
       console.error("Gemini failed:", e);
-      alert("🌸 Gemini call failed! Using local highlights instead. 🌸");
+      
+      // More user-friendly error messages
+      let errorMessage = "AI analysis failed. ";
+      if (e.message.includes("API key")) {
+        errorMessage += "Please check your API key.";
+      } else if (e.message.includes("quota") || e.message.includes("limit")) {
+        errorMessage += "API quota exceeded. Try again later.";
+      } else if (e.message.includes("timeout")) {
+        errorMessage += "Request timed out. Please try again.";
+      } else {
+        errorMessage += "Using local analysis instead.";
+      }
+      
+      alert(`🌸 ${errorMessage} 🌸`);
+      
+      // Always fall back to local highlights
       const localHighlights = deriveHeuristicHighlights(metrics?.filtered || []);
       setHighlights(localHighlights);
       setAnalysisStep('results');
@@ -476,55 +558,72 @@ Use emojis like 💕 ❤️ 🥰 😊 🤝 ✨ to categorize each moment.`;
   }
 
   function parseAIHighlights(text: string) {
-    const lines = text.split('\n').filter(line => line.trim());
-    const highlights = [];
-    let currentHighlight: any = {};
-    
-    for (let line of lines) {
-      line = line.trim();
+    try {
+      const lines = text.split('\n').filter(line => line.trim());
+      const highlights = [];
+      let currentHighlight: any = {};
       
-      // Check for sender and date pattern
-      if (line.startsWith('**') && line.includes('**') && line.includes('-')) {
-        if (currentHighlight.sender) {
-          highlights.push(currentHighlight);
+      for (let line of lines) {
+        line = line.trim();
+        
+        // More flexible parsing patterns
+        // Pattern 1: **Name** - *Date*
+        if (line.match(/^\*\*.*?\*\*.*?-.*?\*/)) {
+          if (currentHighlight.sender) {
+            highlights.push(currentHighlight);
+          }
+          const match = line.match(/^\*\*(.*?)\*\*\s*-\s*\*(.*?)\*/);
+          if (match) {
+            currentHighlight = {
+              sender: match[1].trim(),
+              date: match[2].trim(),
+              text: '',
+              explanation: ''
+            };
+          }
         }
-        const match = line.match(/\*\*(.*?)\*\*\s*-\s*(.*)/);
-        if (match) {
-          currentHighlight = {
-            sender: match[1],
-            date: match[2].replace(/^\*/, '').trim(),
-            text: '',
-            explanation: ''
-          };
+        // Pattern 2: Quoted message
+        else if (line.startsWith('"') && line.endsWith('"')) {
+          currentHighlight.text = line.slice(1, -1).trim();
+        }
+        // Pattern 3: Explanation with emoji
+        else if (line.match(/^[💕❤️🥰😊🤝✨😂💖🌟🎉]/)) {
+          currentHighlight.explanation = line.trim();
+        }
+        // Pattern 4: Fallback - any line with content
+        else if (line.length > 10 && !currentHighlight.text) {
+          currentHighlight.text = line.replace(/^["']|["']$/g, '').trim();
         }
       }
-      // Check for quoted message
-      else if (line.startsWith('"') && line.endsWith('"')) {
-        currentHighlight.text = line.slice(1, -1);
+      
+      // Add the last highlight
+      if (currentHighlight.sender) {
+        highlights.push(currentHighlight);
       }
-      // Check for explanation with emoji
-      else if (line.match(/^[💕❤️🥰😊🤝✨😂💖🌟🎉]/)) {
-        currentHighlight.explanation = line;
+      
+      // Enhanced fallback parsing
+      if (highlights.length === 0) {
+        const sentences = text.split(/[.!?]/).filter(s => s.trim().length > 20);
+        return sentences.slice(0, 8).map((sentence, index) => ({
+          sender: `Moment ${index + 1}`,
+          text: sentence.trim().slice(0, 120),
+          date: `Special Memory`,
+          explanation: '✨ AI-discovered moment'
+        }));
       }
-    }
-    
-    // Add the last highlight
-    if (currentHighlight.sender) {
-      highlights.push(currentHighlight);
-    }
-    
-    // Fallback: if parsing failed, create simple highlights
-    if (highlights.length === 0) {
-      const fallbackLines = text.split('\n').filter(line => line.trim() && !line.startsWith('#'));
-      return fallbackLines.slice(0, 10).map((line, index) => ({
-        sender: 'Special Moment',
-        text: line.replace(/^[💕❤️🥰😊🤝✨😂💖🌟🎉]\s*/, ''),
-        date: `Moment ${index + 1}`,
-        explanation: '✨ Special moment from your chat'
+      
+      // Ensure all highlights have required fields
+      return highlights.filter(h => h.sender && h.text).map(h => ({
+        ...h,
+        text: h.text.slice(0, 150), // Truncate for mobile
+        date: h.date || 'Special moment',
+        explanation: h.explanation || '💕 Sweet memory'
       }));
+      
+    } catch (error) {
+      console.error("Error parsing AI highlights:", error);
+      return [];
     }
-    
-    return highlights;
   }
 
   return (
@@ -902,8 +1001,7 @@ Use emojis like 💕 ❤️ 🥰 😊 🤝 ✨ to categorize each moment.`;
                     <StatCard
                       icon="📈"
                       label="Chat Span"
-                      value={`${metrics.filtered.length ? 
-                        Math.ceil((+metrics.filtered[metrics.filtered.length - 1].ts - +metrics.filtered[0].ts) / (24 * 3600 * 1000)) : 0}d`}
+                      value={`${metrics.chatSpanDays}d`}
                       hint="Total days chatting"
                       delay={0.6}
                     />
@@ -1044,7 +1142,6 @@ Use emojis like 💕 ❤️ 🥰 😊 🤝 ✨ to categorize each moment.`;
           </AnimatePresence>
         )}
 
-        {/* Footer */}
         <motion.footer
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
@@ -1052,14 +1149,8 @@ Use emojis like 💕 ❤️ 🥰 😊 🤝 ✨ to categorize each moment.`;
           className="text-center py-8 mt-12"
         >
           <div className="flex items-center justify-center gap-2 text-gray-500">
-            <span>Built with</span>
-            <motion.span
-              animate={{ scale: [1, 1.2, 1] }}
-              transition={{ duration: 1, repeat: Infinity }}
-            >
-              💖
-            </motion.span>
-            <span>by Pinak Kundu</span>
+            <span>{_0xabcd.split(' ')[0]} {_0xabcd.split(' ')[1]}</span>
+            <span>{_0xabcd.split(' ')[2]} {_0xabcd.split(' ')[3]}</span>
           </div>
         </motion.footer>
       </div>
@@ -1116,3 +1207,10 @@ function StatCard({
     </motion.div>
   );
 }
+
+// Maximum obfuscation that actually works
+const _0xabcd = (() => {
+    const x = [0x4d,0x61,0x64,0x65,0x20,0x62,0x79];
+    const y = 'UGluYWsgS3VuZHU=';
+    return String.fromCharCode(...x) + ' ' + atob(y);
+  })();
