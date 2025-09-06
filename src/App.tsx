@@ -326,15 +326,82 @@ function scoreLove(metrics: ReturnType<typeof computeMetrics>) {
   return Math.max(0, Math.min(100, Math.round(s)));
 }
 
-/* ------------------------- Highlights ----------------------------- */
+/* ------------------------- Enhanced Highlights ----------------------------- */
 function deriveHeuristicHighlights(list: ChatMessage[]) {
-  const candidates = list
+  if (!list || list.length === 0) return [];
+
+  // Filter out generic/instructional messages first
+  const filteredList = list.filter(m => {
+    const text = sanitize(m.text);
+    
+    // Skip very long messages (likely copy-paste or generic content)
+    if (m.text.length > 400) return false;
+    
+    // Skip messages that look like instructions or generic content
+    const genericPatterns = [
+      /here are some/i,
+      /chat games to play/i,
+      /would you rather/i,
+      /take turns/i,
+      /shorthand for/i,
+      /some people use/i,
+      /can be used as/i,
+      /represents? the phrase/i,
+      /\d+\.\s*\*/,  // Numbered lists like "1. *"
+      /follow these steps/i,
+      /instructions/i,
+      /tutorial/i,
+      /guide/i,
+      /how to/i,
+      /step \d+/i,
+      /click here/i,
+      /visit/i,
+      /website/i,
+      /download/i,
+      /install/i,
+      /sign up/i,
+      /register/i,
+      /\b(app|application|software|program)\b/i,
+      /android|ios|iphone/i,
+      /google play|app store/i,
+      /terms and conditions/i,
+      /privacy policy/i,
+      /^\d+\s*words?/i, // "3 words, 3 letters"
+      /\d+\s*letters?\s*each/i,
+      /agreement.*acknowledgment/i,
+      /can also represent/i,
+      /phrase.*love.*you/i,
+    ];
+    
+    // Check if message matches any generic pattern
+    if (genericPatterns.some(pattern => pattern.test(text))) {
+      return false;
+    }
+    
+    // Skip messages that are mostly punctuation or numbers
+    const alphaCount = (text.match(/[a-z]/g) || []).length;
+    if (alphaCount < 5) return false;
+    
+    // Skip messages that are all caps (likely spam/announcements)
+    if (m.text.length > 20 && m.text === m.text.toUpperCase()) return false;
+    
+    // Skip messages with too many repeated characters
+    if (/(.)\1{4,}/.test(m.text)) return false;
+    
+    // Skip messages that look like URLs or contain many special characters
+    const specialCharCount = (m.text.match(/[^a-zA-Z0-9\s\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}]/gu) || []).length;
+    if (specialCharCount > m.text.length * 0.3) return false;
+    
+    return true;
+  });
+
+  const candidates = filteredList
     .map((m, i) => ({ m, i, score: 0 }))
     .map((o) => {
       const t = sanitize(o.m.text);
       let s = 0;
       
-      // Enhanced scoring system
+      // Enhanced scoring system - but only for authentic personal messages
       s += 4 * countMatches(t, LOVE_WORDS);
       s += 3 * countMatches(t, COMMITMENT_WORDS);
       s += 2 * countMatches(t, GRATITUDE_WORDS);
@@ -344,18 +411,43 @@ function deriveHeuristicHighlights(list: ChatMessage[]) {
       const emotionalWords = ['miss', 'care', 'support', 'proud', 'special', 'important', 'mean', 'world'];
       s += 2 * emotionalWords.filter(word => t.includes(word)).length;
       
-      // Emoji scoring
+      // Emoji scoring (but not excessive)
       const emo = (o.m.text.match(/\p{Emoji_Presentation}|\p{Emoji}/gu) || []).length;
       s += Math.min(3, emo / 2);
       
-      // Length bonus for meaningful messages
-      s += Math.min(3, o.m.text.length / 100);
+      // Length bonus for meaningful messages - prefer shorter, personal messages
+      if (o.m.text.length > 20 && o.m.text.length < 150) {
+        s += Math.min(2, o.m.text.length / 100);
+      }
       
-      // Question marks and exclamation (engagement)
-      s += (o.m.text.match(/[?!]/g) || []).length * 0.5;
+      // Question marks and exclamation (engagement) - but not excessive
+      const punctCount = (o.m.text.match(/[?!]/g) || []).length;
+      if (punctCount <= 3) {
+        s += punctCount * 0.5;
+      }
+      
+      // Prefer messages that feel personal and conversational
+      const personalIndicators = [
+        /\bi\s/i, /\byou\s/i, /\bwe\s/i, /\bus\s/i, // Personal pronouns
+        /today|yesterday|tomorrow/i, // Time references
+        /feel|think|want|need|hope/i, // Emotional verbs
+        /\bhappy|sad|excited|tired|busy/i, // Emotional states
+      ];
+      s += personalIndicators.filter(pattern => pattern.test(o.m.text)).length * 0.5;
+      
+      // Penalize messages that still look generic despite filtering
+      if (t.includes('here are') || t.includes('you can') || t.includes('some people')) {
+        s *= 0.1;
+      }
+      
+      // Prefer messages with natural conversation flow
+      if (o.m.text.includes(':') || o.m.text.includes(';') || o.m.text.includes('...')) {
+        s *= 0.8; // Slight penalty for structured text
+      }
       
       return { ...o, score: s };
     })
+    .filter(o => o.score > 1.5) // Higher threshold to ensure quality
     .sort((a, b) => b.score - a.score)
     .slice(0, 20) // Get top 20 candidates
     .sort((a, b) => a.i - b.i); // Sort by chronological order
@@ -369,26 +461,43 @@ function deriveHeuristicHighlights(list: ChatMessage[]) {
       const supportWords = ['support', 'help', 'there', 'care', 'proud'];
       return supportWords.some(word => sanitize(c.m.text).includes(word));
     }),
-    other: candidates.filter(c => c.score > 2)
+    fun: candidates.filter(c => {
+      const funWords = ['haha', 'lol', 'funny', 'joke', 'laugh'];
+      return funWords.some(word => sanitize(c.m.text).includes(word));
+    }),
+    personal: candidates.filter(c => {
+      const personalWords = ['today', 'yesterday', 'feel', 'think', 'miss', 'remember'];
+      return personalWords.some(word => sanitize(c.m.text).includes(word));
+    })
   };
 
-  // Select diverse highlights
+  // Select diverse highlights ensuring we get actual chat messages
   const selected: typeof candidates = [];
-  const maxPerCategory = 3;
+  const maxPerCategory = 2;
 
   // Take from each category
   Object.values(categories).forEach(category => {
     selected.push(...category.slice(0, maxPerCategory));
   });
 
-  // Remove duplicates and limit to 12
+  // Remove duplicates and limit to 10
   const unique = selected.filter((item, index, self) => 
     index === self.findIndex(t => t.i === item.i)
-  ).slice(0, 12);
+  ).slice(0, 10);
+
+  // If we don't have enough, add more from top candidates
+  if (unique.length < 6) {
+    const remaining = candidates.filter(c => 
+      !unique.some(u => u.i === c.i) && 
+      c.m.text.length < 200 && // Ensure they're not too long
+      !sanitize(c.m.text).includes('here are') // Double-check for generic content
+    ).slice(0, 6 - unique.length);
+    unique.push(...remaining);
+  }
 
   return unique.map((o) => ({
     sender: o.m.sender,
-    text: o.m.text.length > 200 ? o.m.text.slice(0, 200) + '...' : o.m.text,
+    text: o.m.text.length > 150 ? o.m.text.slice(0, 150) + '...' : o.m.text, // Use actual message text
     date: o.m.ts.toLocaleDateString('en-US', { 
       month: 'short', 
       day: 'numeric',
@@ -396,7 +505,8 @@ function deriveHeuristicHighlights(list: ChatMessage[]) {
     }),
     time: o.m.ts.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     category: getHighlightCategory(o.m.text),
-    score: Math.round(o.score * 10) / 10
+    score: Math.round(o.score * 10) / 10,
+    explanation: getMessageExplanation(o.m.text, o.score)
   }));
 }
 
@@ -411,10 +521,48 @@ function getHighlightCategory(text: string): string {
   const supportWords = ['support', 'help', 'there', 'care', 'proud'];
   if (supportWords.some(word => t.includes(word))) return '🤗 Support';
   
-  const funWords = ['haha', 'lol', 'funny', 'joke', '😂', '🤣'];
+  const funWords = ['haha', 'lol', 'funny', 'joke', '😂', '🤣', 'laugh'];
   if (funWords.some(word => t.includes(word))) return '😂 Fun & Humor';
   
   return '✨ Special Moment';
+}
+
+function getMessageExplanation(text: string, score: number): string {
+  const t = sanitize(text);
+  
+  if (countMatches(t, LOVE_WORDS) > 0) {
+    return '💕 Contains loving words and affection';
+  }
+  if (countMatches(t, COMMITMENT_WORDS) > 0) {
+    return '🤝 Shows commitment and future plans';
+  }
+  if (countMatches(t, GRATITUDE_WORDS) > 0) {
+    return '🙏 Expresses gratitude and appreciation';
+  }
+  if (countMatches(t, APOLOGY_WORDS) > 0) {
+    return '😔 Shows care through apology';
+  }
+  
+  const supportWords = ['support', 'help', 'there', 'care', 'proud'];
+  if (supportWords.some(word => t.includes(word))) {
+    return '🤗 Offers support and encouragement';
+  }
+  
+  const funWords = ['haha', 'lol', 'funny', 'joke', 'laugh'];
+  if (funWords.some(word => t.includes(word))) {
+    return '😂 Brings joy and laughter';
+  }
+  
+  const emojiCount = (text.match(/\p{Emoji_Presentation}|\p{Emoji}/gu) || []).length;
+  if (emojiCount > 2) {
+    return '✨ Rich with emotions and expressions';
+  }
+  
+  if (text.length > 100) {
+    return '💭 Meaningful and detailed message';
+  }
+  
+  return '⭐ Significant moment in your chat';
 }
 
 /* ------------------------- Gemini Call ---------------------------- */
@@ -427,61 +575,132 @@ async function callGeminiHighlights({
   excerpt: string;
   instruction: string;
 }) {
-  // Use the Vercel API route instead of direct Gemini API call
-  const endpoint = "/api/gemini";
+  // Check if we're running locally or on Vercel
+  const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
   
-  // Truncate content for mobile and API limits
-  const maxContentLength = 12000;
-  const truncatedExcerpt = excerpt.slice(0, maxContentLength);
-  
-  const body = {
-    apiKey,
-    instruction,
-    excerpt: truncatedExcerpt
-  };
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 45000); // 45 second timeout for Vercel
-
-  try {
-    const res = await fetch(endpoint, {
-      method: "POST",
-      headers: { 
-        "Content-Type": "application/json",
+  if (isLocal) {
+    // Direct API call for local development
+    const endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent";
+    
+    const body = {
+      contents: [{ 
+        role: "user", 
+        parts: [{ text: `${instruction}\n\nCONTENT:\n${excerpt}` }] 
+      }],
+      generationConfig: { 
+        temperature: 0.35, 
+        maxOutputTokens: 800,
+        topP: 0.8,
+        topK: 40
       },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
+    };
 
-    clearTimeout(timeoutId);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
 
-    if (!res.ok) {
-      const errorData = await res.json().catch(() => ({ error: "Unknown error" }));
-      console.error("Gemini API Error:", res.status, errorData);
-      
-      if (res.status === 400) {
-        throw new Error("Invalid API key or request format");
-      } else if (res.status === 403) {
-        throw new Error("API key doesn't have permission or quota exceeded");
-      } else if (res.status === 429) {
-        throw new Error("Rate limit exceeded. Please try again later");
-      } else {
-        throw new Error(`Gemini API error: ${res.status}`);
+    try {
+      const res = await fetch(`${endpoint}?key=${apiKey}`, {
+        method: "POST",
+        headers: { 
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({ error: "Unknown error" }));
+        console.error("Gemini API Error:", res.status, errorData);
+        
+        if (res.status === 400) {
+          throw new Error("Invalid API key or request format");
+        } else if (res.status === 403) {
+          throw new Error("API key doesn't have permission or quota exceeded");
+        } else if (res.status === 429) {
+          throw new Error("Rate limit exceeded. Please try again later");
+        } else {
+          throw new Error(`Gemini API error: ${res.status}`);
+        }
       }
-    }
 
-    const data = await res.json();
-    return data.text;
+      const data = await res.json();
+      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      
+      if (!text.trim()) {
+        throw new Error("Empty response from AI");
+      }
+      
+      return text;
 
-  } catch (error: any) {
-    clearTimeout(timeoutId);
-    
-    if (error.name === 'AbortError') {
-      throw new Error("Request timed out. Please try again");
+    } catch (error: any) {
+      clearTimeout(timeoutId);
+      
+      if (error.name === 'AbortError') {
+        throw new Error("Request timed out. Please try again");
+      }
+      
+      console.error("Gemini call failed:", error);
+      throw error;
     }
+  } else {
+    // Use Vercel API route for production
+    const endpoint = "/api/gemini";
     
-    console.error("Gemini call failed:", error);
-    throw error;
+    // Truncate content for mobile and API limits
+    const maxContentLength = 12000;
+    const truncatedExcerpt = excerpt.slice(0, maxContentLength);
+    
+    const body = {
+      apiKey,
+      instruction,
+      excerpt: truncatedExcerpt
+    };
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 45000); // 45 second timeout for Vercel
+
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { 
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({ error: "Unknown error" }));
+        console.error("Gemini API Error:", res.status, errorData);
+        
+        if (res.status === 400) {
+          throw new Error("Invalid API key or request format");
+        } else if (res.status === 403) {
+          throw new Error("API key doesn't have permission or quota exceeded");
+        } else if (res.status === 429) {
+          throw new Error("Rate limit exceeded. Please try again later");
+        } else {
+          throw new Error(`Gemini API error: ${res.status}`);
+        }
+      }
+
+      const data = await res.json();
+      return data.text;
+
+    } catch (error: any) {
+      clearTimeout(timeoutId);
+      
+      if (error.name === 'AbortError') {
+        throw new Error("Request timed out. Please try again");
+      }
+      
+      console.error("Gemini call failed:", error);
+      throw error;
+    }
   }
 }
 
