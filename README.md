@@ -212,22 +212,6 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 - **React community** for excellent ecosystem
 - **All contributors** who make this project better
 
-## 🔗 Links
-
-- **Live Demo**: [https://lovelens.vercel.app](https://lovelens.vercel.app)
-- **Documentation**: [Coming Soon]
-- **Bug Reports**: [GitHub Issues](https://github.com/yourusername/lovelens/issues)
-- **Feature Requests**: [GitHub Discussions](https://github.com/yourusername/lovelens/discussions)
-
-## 📞 Support
-
-Having trouble? We're here to help!
-
-- 📧 **Email**: support@lovelens.app
-- 💬 **Discord**: [Join our community](https://discord.gg/lovelens)
-- 🐦 **Twitter**: [@LoveLensApp](https://twitter.com/LoveLensApp)
-- 📚 **Documentation**: [docs.lovelens.app](https://docs.lovelens.app)
-
 ---
 
 Made with 💕 by Pinak Kundu
