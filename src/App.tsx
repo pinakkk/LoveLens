@@ -333,25 +333,88 @@ function deriveHeuristicHighlights(list: ChatMessage[]) {
     .map((o) => {
       const t = sanitize(o.m.text);
       let s = 0;
-      s += 3 * countMatches(t, LOVE_WORDS);
-      s += 2 * countMatches(t, COMMITMENT_WORDS);
-      s += 1 * countMatches(t, GRATITUDE_WORDS);
-      s += 1.5 * countMatches(t, APOLOGY_WORDS);
+      
+      // Enhanced scoring system
+      s += 4 * countMatches(t, LOVE_WORDS);
+      s += 3 * countMatches(t, COMMITMENT_WORDS);
+      s += 2 * countMatches(t, GRATITUDE_WORDS);
+      s += 2 * countMatches(t, APOLOGY_WORDS);
+      
+      // Bonus for emotional expressions
+      const emotionalWords = ['miss', 'care', 'support', 'proud', 'special', 'important', 'mean', 'world'];
+      s += 2 * emotionalWords.filter(word => t.includes(word)).length;
+      
+      // Emoji scoring
       const emo = (o.m.text.match(/\p{Emoji_Presentation}|\p{Emoji}/gu) || []).length;
-      s += Math.min(2, emo / 3);
-      s += Math.min(2, o.m.text.length / 120);
+      s += Math.min(3, emo / 2);
+      
+      // Length bonus for meaningful messages
+      s += Math.min(3, o.m.text.length / 100);
+      
+      // Question marks and exclamation (engagement)
+      s += (o.m.text.match(/[?!]/g) || []).length * 0.5;
+      
       return { ...o, score: s };
     })
     .sort((a, b) => b.score - a.score)
-    .slice(0, 15)
-    .sort((a, b) => a.i - b.i);
+    .slice(0, 20) // Get top 20 candidates
+    .sort((a, b) => a.i - b.i); // Sort by chronological order
 
-  return candidates.map((o) => ({
+  // Group by categories for better variety
+  const categories = {
+    love: candidates.filter(c => countMatches(sanitize(c.m.text), LOVE_WORDS) > 0),
+    commitment: candidates.filter(c => countMatches(sanitize(c.m.text), COMMITMENT_WORDS) > 0),
+    gratitude: candidates.filter(c => countMatches(sanitize(c.m.text), GRATITUDE_WORDS) > 0),
+    support: candidates.filter(c => {
+      const supportWords = ['support', 'help', 'there', 'care', 'proud'];
+      return supportWords.some(word => sanitize(c.m.text).includes(word));
+    }),
+    other: candidates.filter(c => c.score > 2)
+  };
+
+  // Select diverse highlights
+  const selected: typeof candidates = [];
+  const maxPerCategory = 3;
+
+  // Take from each category
+  Object.values(categories).forEach(category => {
+    selected.push(...category.slice(0, maxPerCategory));
+  });
+
+  // Remove duplicates and limit to 12
+  const unique = selected.filter((item, index, self) => 
+    index === self.findIndex(t => t.i === item.i)
+  ).slice(0, 12);
+
+  return unique.map((o) => ({
     sender: o.m.sender,
-    text: o.m.text,
-    date: o.m.ts.toLocaleDateString(),
-    time: o.m.ts.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    text: o.m.text.length > 200 ? o.m.text.slice(0, 200) + '...' : o.m.text,
+    date: o.m.ts.toLocaleDateString('en-US', { 
+      month: 'short', 
+      day: 'numeric',
+      year: o.m.ts.getFullYear() !== new Date().getFullYear() ? 'numeric' : undefined 
+    }),
+    time: o.m.ts.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    category: getHighlightCategory(o.m.text),
+    score: Math.round(o.score * 10) / 10
   }));
+}
+
+function getHighlightCategory(text: string): string {
+  const t = sanitize(text);
+  
+  if (countMatches(t, LOVE_WORDS) > 0) return '💕 Love & Affection';
+  if (countMatches(t, COMMITMENT_WORDS) > 0) return '🤝 Commitment';
+  if (countMatches(t, GRATITUDE_WORDS) > 0) return '🙏 Gratitude';
+  if (countMatches(t, APOLOGY_WORDS) > 0) return '😔 Apology';
+  
+  const supportWords = ['support', 'help', 'there', 'care', 'proud'];
+  if (supportWords.some(word => t.includes(word))) return '🤗 Support';
+  
+  const funWords = ['haha', 'lol', 'funny', 'joke', '😂', '🤣'];
+  if (funWords.some(word => t.includes(word))) return '😂 Fun & Humor';
+  
+  return '✨ Special Moment';
 }
 
 /* ------------------------- Gemini Call ---------------------------- */
@@ -364,34 +427,27 @@ async function callGeminiHighlights({
   excerpt: string;
   instruction: string;
 }) {
-  const endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent";
+  // Use the Vercel API route instead of direct Gemini API call
+  const endpoint = "/api/gemini";
   
-  // Truncate content more aggressively for mobile
-  const maxContentLength = 15000; // Reduced from 18000
+  // Truncate content for mobile and API limits
+  const maxContentLength = 12000;
   const truncatedExcerpt = excerpt.slice(0, maxContentLength);
   
   const body = {
-    contents: [{ 
-      role: "user", 
-      parts: [{ text: `${instruction}\n\nCONTENT:\n${truncatedExcerpt}` }] 
-    }],
-    generationConfig: { 
-      temperature: 0.35, 
-      maxOutputTokens: 800, // Reduced from 1024
-      topP: 0.8,
-      topK: 40
-    },
+    apiKey,
+    instruction,
+    excerpt: truncatedExcerpt
   };
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+  const timeoutId = setTimeout(() => controller.abort(), 45000); // 45 second timeout for Vercel
 
   try {
-    const res = await fetch(`${endpoint}?key=${apiKey}`, {
+    const res = await fetch(endpoint, {
       method: "POST",
       headers: { 
         "Content-Type": "application/json",
-        "User-Agent": "LoveLens/1.0"
       },
       body: JSON.stringify(body),
       signal: controller.signal,
@@ -400,10 +456,9 @@ async function callGeminiHighlights({
     clearTimeout(timeoutId);
 
     if (!res.ok) {
-      const errorText = await res.text().catch(() => "Unknown error");
-      console.error("Gemini API Error:", res.status, errorText);
+      const errorData = await res.json().catch(() => ({ error: "Unknown error" }));
+      console.error("Gemini API Error:", res.status, errorData);
       
-      // Provide more specific error messages
       if (res.status === 400) {
         throw new Error("Invalid API key or request format");
       } else if (res.status === 403) {
@@ -416,13 +471,8 @@ async function callGeminiHighlights({
     }
 
     const data = await res.json();
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    
-    if (!text.trim()) {
-      throw new Error("Empty response from AI");
-    }
-    
-    return text;
+    return data.text;
+
   } catch (error: any) {
     clearTimeout(timeoutId);
     
@@ -1083,38 +1133,40 @@ Focus on love, support, humor, promises, and heartfelt moments. Use emojis: 💕
                         whileHover={{ scale: 1.02 }}
                         className="p-6 bg-gradient-to-r from-pink-50 to-rose-50 rounded-2xl border border-pink-200 hover:shadow-md transition-all duration-300"
                       >
-                        {highlight.sender ? (
-                          <div>
-                            <div className="flex items-center justify-between mb-3">
-                              <div className="flex items-center gap-3">
-                                <div className="w-8 h-8 bg-gradient-to-r from-pink-400 to-rose-400 rounded-full flex items-center justify-center text-white font-bold text-sm">
-                                  {highlight.sender.charAt(0).toUpperCase()}
-                                </div>
-                                <span className="font-semibold text-gray-800">{highlight.sender}</span>
-                              </div>
-                              <span className="text-xs text-gray-500">{highlight.date}</span>
+                        <div className="flex items-center justify-between mb-3">
+                          <div className="flex items-center gap-3">
+                            <div className="w-8 h-8 bg-gradient-to-r from-pink-400 to-rose-400 rounded-full flex items-center justify-center text-white font-bold text-sm">
+                              {highlight.sender.charAt(0).toUpperCase()}
                             </div>
-                            <div className="bg-white/60 rounded-xl p-4 mb-3">
-                              <p className="text-gray-700 italic">"{highlight.text}"</p>
+                            <div>
+                              <span className="font-semibold text-gray-800">{highlight.sender}</span>
+                              {highlight.category && (
+                                <div className="text-xs text-purple-600 font-medium">{highlight.category}</div>
+                              )}
                             </div>
-                            {highlight.explanation && (
-                              <p className="text-sm text-gray-600">{highlight.explanation}</p>
+                          </div>
+                          <div className="text-right">
+                            <div className="text-xs text-gray-500">{highlight.date}</div>
+                            {highlight.time && (
+                              <div className="text-xs text-gray-400">{highlight.time}</div>
                             )}
                           </div>
-                        ) : (
-                          <div>
-                            <div className="flex items-center justify-between mb-3">
-                              <div className="flex items-center gap-3">
-                                <div className="w-8 h-8 bg-gradient-to-r from-pink-400 to-rose-400 rounded-full flex items-center justify-center text-white font-bold text-sm">
-                                  {highlight.sender.charAt(0).toUpperCase()}
-                                </div>
-                                <span className="font-semibold text-gray-800">{highlight.sender}</span>
-                              </div>
-                              <span className="text-xs text-gray-500">{highlight.date} • {highlight.time}</span>
-                            </div>
-                            <div className="bg-white/60 rounded-xl p-4">
-                              <p className="text-gray-700">"{highlight.text}"</p>
-                            </div>
+                        </div>
+                        
+                        <div className="bg-white/60 rounded-xl p-4 mb-3">
+                          <p className="text-gray-700">{highlight.explanation ? `"${highlight.text}"` : highlight.text}</p>
+                        </div>
+                        
+                        {highlight.explanation && (
+                          <div className="flex items-start gap-2">
+                            <span className="text-purple-500 text-sm">💡</span>
+                            <p className="text-sm text-gray-600 italic">{highlight.explanation}</p>
+                          </div>
+                        )}
+                        
+                        {highlight.score && (
+                          <div className="mt-2 text-right">
+                            <span className="text-xs text-gray-400">Significance: {highlight.score}/10</span>
                           </div>
                         )}
                       </motion.div>
@@ -1142,6 +1194,7 @@ Focus on love, support, humor, promises, and heartfelt moments. Use emojis: 💕
           </AnimatePresence>
         )}
 
+        {/* Footer */}
         <motion.footer
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
